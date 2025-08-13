@@ -1,0 +1,6 @@
+numpy
+tifffile
+nd2reader
+tensorflow
+scikit-image
+opencv-python
