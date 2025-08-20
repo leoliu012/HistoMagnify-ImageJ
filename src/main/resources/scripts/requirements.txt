@@ -4,3 +4,4 @@ nd2reader
 tensorflow
 scikit-image
 opencv-python
+imagecodecs

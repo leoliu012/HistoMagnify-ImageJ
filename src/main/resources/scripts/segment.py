@@ -1,134 +1,120 @@
-#!/usr/bin/env python3
-#/src/main/resources/scripts
-import os, argparse
+
+import cv2
 import numpy as np
-import copy
 import tifffile
-from nd2reader import ND2Reader
+import os
+import argparse
+from PIL import Image, ImageSequence
+
 from src.core.model_archi import multi_unet_model_trans
 from src.core.segmentation import run_patches
-from src.core.image_enhance import (
-    auto_enhance_single_channel,
-    auto_enhance_multi_channel
-)
 
-MODEL_MAP      = {
-    'ACTN4':      'ACTN4.hdf5',
-    'DAPI':       'DAPI.hdf5',
-    'NHS_SINGLE_CHANNEL': 'NHS_ester_single.hdf5',
-    'NHS_COMBINED_ACTN4':    'NHS_ester_com.hdf5',
+MODEL_MAP = {'20x': '20x.hdf5', '40x': '40x.hdf5'}
+MODEL_CHANNELS = {'20x': 1, '40x': 1}
+MODEL_CLASSES  = {'20x': 6, '40x': 3}
+MODEL_PARAMS = {
+    '20x': dict(P_HEIGHT=720, P_WIDTH=960, MODEL_HEIGHT=576, MODEL_WIDTH=768),
+    '40x': dict(P_HEIGHT=576, P_WIDTH=768, MODEL_HEIGHT=576, MODEL_WIDTH=768),
 }
-MODEL_CHANNELS = {'ACTN4':1,'DAPI':1,'NHS_SINGLE_CHANNEL':1,'NHS_COMBINED_ACTN4':2}
-MODEL_CLASSES  = {'ACTN4':2,'DAPI':2,'NHS_SINGLE_CHANNEL':3,'NHS_COMBINED_ACTN4':3}
-PATCH_SIZE = 576
 
-def read_plane(nd2_path, z, c, t=0, c2=None):
-    with ND2Reader(nd2_path) as rdr:
-        rdr.bundle_axes = ['y','x']
-        sizes = rdr.sizes
-        iter_axes = [ax for ax in ('t','z','c') if sizes.get(ax,1) > 1]
-        rdr.iter_axes = iter_axes
+def read_page(tif_path, page_index):
+    with Image.open(tif_path) as im:
+        frame = None
+        for i, f in enumerate(ImageSequence.Iterator(im)):
+            if i == page_index:
+                frame = f.copy()
+                break
+    if frame is None:
+        raise RuntimeError(f"Page {page_index} not found")
+    return np.array(frame)
 
-        frames = [frame for frame in rdr]
-        stack = np.stack(frames, axis=0)  # flattened over iter_axes
+def to_gray8(arr):
+    a = np.asarray(arr)
 
-        # multipliers for flat indexing
-        lengths = [sizes[ax] for ax in iter_axes]
-        multipliers = []
-        for i in range(len(iter_axes)):
-            prod = 1
-            for L in lengths[i+1:]:
-                prod *= L
-            multipliers.append(prod)
+    if a.dtype == np.bool_:
+        a = a.astype(np.uint8) * 255
 
-        def flat_index(ti, zi, ci):
-            picks = []
-            for ax in iter_axes:
-                if ax == 't':
-                    picks.append(ti)
-                elif ax == 'z':
-                    picks.append(zi)
-                elif ax == 'c':
-                    picks.append(ci)
-            return sum(pi * mul for pi, mul in zip(picks, multipliers)) if picks else 0
+    if a.dtype == np.uint16:
+        g = (a >> 8).astype(np.uint8)
 
-        if c2 is None:
-            fi = flat_index(t, z, c)
-            plane = stack[fi].astype(np.float32)
-            return plane
+    elif a.dtype == np.uint8:
+        g = a
+
+    else:
+        a = a.astype(np.float32)
+        amin, amax = float(np.nanmin(a)), float(np.nanmax(a))
+        if amax > amin:
+            g = ((a - amin) * (255.0 / (amax - amin))).astype(np.uint8)
         else:
-            fi1 = flat_index(t, z, c)   # e.g., NHS
-            fi2 = flat_index(t, z, c2)  # e.g., ACTN4
-            plane1 = stack[fi1].astype(np.float32)
-            plane2 = stack[fi2].astype(np.float32)
-            return np.stack((plane1, plane2), axis=0)  # shape (2, H, W)
+            g = np.zeros_like(a, dtype=np.uint8)
+
+    if g.ndim == 3:
+        if g.shape[2] >= 3:
+            g = cv2.cvtColor(g, cv2.COLOR_RGB2GRAY)
+        else:
+            g = g[..., 0]
+
+    return g
+
+
+def clahe_first_page(arr):
+    g8 = to_gray8(arr)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    return clahe.apply(g8)
 
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--nd2', required=True)
-    p.add_argument('--z', type=int, required=True)
-    p.add_argument('--channel', type=int, required=True,
-                   help="0-based; use -1 for NHS_COM two-channel")
-    p.add_argument('--channel2', type=int, default=-1,
-                   help="Second channel (only for NHS_COMBINED_ACTN4)")
+    p.add_argument('--tif', required=True)
+    p.add_argument('--page', type=int, default=0)
     p.add_argument('--modeldir', required=True)
-    p.add_argument('--model', choices=MODEL_MAP, required=True)
-    p.add_argument('--output', required=True,
-                   help="segmentation label TIFF")
-    p.add_argument('--plow', type=float, default=1.0)
+    p.add_argument('--model', choices=MODEL_MAP.keys(), required=True)
+    p.add_argument('--output', required=True)
+    p.add_argument('--enhance', type=int, default=1)   # 1 = CLAHE, 0 = skip
+    p.add_argument('--plow',  type=float, default=1.0)
     p.add_argument('--phigh', type=float, default=99.7)
+    p.add_argument('--save_enhanced', default=None)
+
     args = p.parse_args()
 
-    #read & normalize
-    # read & normalize (support 2-ch for combined model)
-    if args.model == 'NHS_COMBINED_ACTN4':
-        if args.channel2 < 0:
-            raise ValueError("NHS_COMBINED_ACTN4 requires --channel2 (ACTN4 channel).")
-        plane = read_plane(args.nd2, args.z, args.channel, c2=args.channel2).astype(np.float32)
+    plane = read_page(args.tif, args.page)
+
+    if int(args.enhance) == 1:
+
+        g8_for_model = clahe_first_page(plane)
+        if args.save_enhanced:
+            tifffile.imwrite(args.save_enhanced, g8_for_model)
     else:
-        plane = read_plane(args.nd2, args.z, args.channel).astype(np.float32)
-
-    mx = plane.max()
-    plane = plane / mx if mx > 0 else plane
+        g8_for_model = to_gray8(plane)
 
 
+    tmp_plane = os.path.join(args.modeldir, 'plane.tif')
+    tifffile.imwrite(tmp_plane, g8_for_model)
 
-    #save to TIFF for enhancement & patching
-    tmp = os.path.join(args.modeldir, 'plane.tif')
-    tifffile.imwrite(tmp, (plane * 255).astype(np.uint8))
-
-    # enhance in-place at tmp
-    if plane.ndim == 3 and plane.shape[0] == 2:
-        auto_enhance_multi_channel(tmp, tmp, p_low=args.plow, p_high=args.phigh)
-    else:
-        auto_enhance_single_channel(tmp, tmp, p_low=args.plow, p_high=args.phigh)
-
-    #keep a copy for debugging
-    enhanced = tifffile.imread(tmp)
-    enhanced_path = os.path.join(args.modeldir, 'enhanced.tif')
-    tifffile.imwrite(enhanced_path, enhanced)
-
-
+    n_classes = MODEL_CLASSES[args.model]
+    params    = MODEL_PARAMS[args.model]
+    weights   = os.path.join(args.modeldir, MODEL_MAP[args.model])
 
     model = multi_unet_model_trans(
-        n_classes=MODEL_CLASSES[args.model],
-        IMG_HEIGHT=PATCH_SIZE,
-        IMG_WIDTH=PATCH_SIZE,
+        n_classes=n_classes,
+        IMG_HEIGHT=params['MODEL_HEIGHT'],
+        IMG_WIDTH=params['MODEL_WIDTH'],
         IMG_CHANNELS=MODEL_CHANNELS[args.model]
     )
-    weights = os.path.join(args.modeldir, MODEL_MAP[args.model])
     model.load_weights(weights)
 
     seg_map = run_patches(
-        tmp, model,
-        PATCH_SIZE, PATCH_SIZE,
-        MODEL_CLASSES[args.model],
-        PATCH_SIZE, PATCH_SIZE
+        tmp_plane,
+        model,
+        params['P_HEIGHT'],
+        params['P_WIDTH'],
+        n_classes,
+        params['MODEL_WIDTH'],
+        params['MODEL_HEIGHT']
     )
 
     tifffile.imwrite(args.output, seg_map.astype(np.uint8))
     print(f"Segmentation saved to {args.output}")
 
-if __name__=='__main__':
+if __name__ == '__main__':
     main()
