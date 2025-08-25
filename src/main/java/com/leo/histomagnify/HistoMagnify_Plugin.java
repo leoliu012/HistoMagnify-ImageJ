@@ -307,7 +307,7 @@ public class HistoMagnify_Plugin implements PlugIn {
                 if (pyLauncher == null) {
                     IJ.showMessage("HistoMagnify",
                             "Python 3.8+ wasn’t found on this system.\n\n" +
-                                    "Install Python 3.8+ (recommended via the Microsoft Store or python.org),\n" +
+                                    "Install Python 3.8+ (recommended via python.org),\n" +
                                     "then re-run this command.\n\n" +
                                     "Recommended source https://www.python.org/downloads/");
                     return;
